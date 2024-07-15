@@ -21,6 +21,7 @@ int pinctrl_configure_pins(const pinctrl_soc_pin_t *pins, uint8_t pin_cnt, uintp
 	int usart_num = USART_NUM(base);
 #else
         int usart_num = 0;
+		(void)base;
 #endif /*USART_COUNT > 1*/
 
 #endif
