@@ -1,0 +1,20 @@
+# Copyright (c) 2024 Daikin Comfort Technologies North America, Inc.
+# SPDX-License-Identifier: Apache-2.0
+
+# Silicon Labs kconfig file for ieee802154 RAIL interface
+
+menuconfig IEEE802154_SILABS_RAIL
+	bool "Silicon Labs ieee802154 RAIL support"
+	default y
+	depends on DT_HAS_SILABS_RAIL_IEEE802154_ENABLED
+        select SOC_GECKO_USE_RAIL
+
+if IEEE802154_SILABS_RAIL
+
+config IEEE802154_SILABS_RAIL_INIT_PRIO
+	int "Silicon Labs RAIL initialization priority"
+	default 80
+	help
+	  Set the initialization priority number. Do not change it unless
+	  you know what you are doing. It has to start before the net stack.
+endif
