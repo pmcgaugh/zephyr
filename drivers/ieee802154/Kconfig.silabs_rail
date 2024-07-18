@@ -17,4 +17,9 @@ config IEEE802154_SILABS_RAIL_INIT_PRIO
 	help
 	  Set the initialization priority number. Do not change it unless
 	  you know what you are doing. It has to start before the net stack.
+
+config IEEE802154_RAIL_LIB_PATH
+        string "Path to Silicon Labs RAIL library"
+        help
+          Path to the Silicon Labs RAIL library.
 endif
