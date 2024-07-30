@@ -4,12 +4,15 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-#define DT_DRV_COMPAT telink_b91_zb
+/*
+ * Copyright (c) 2021 Telink Semiconductor
+ *
+ * SPDX-License-Identifier: Apache-2.0
+ */
 
-#include "rf.h"
-#include "stimer.h"
+#define DT_DRV_COMPAT silabs_rail_ieee802154
+#define LOG_MODULE_NAME ieee802154_erf32
 
-#define LOG_MODULE_NAME ieee802154_b91
 #if defined(CONFIG_IEEE802154_DRIVER_LOG_LEVEL)
 #define LOG_LEVEL CONFIG_IEEE802154_DRIVER_LOG_LEVEL
 #else
@@ -26,556 +29,283 @@ LOG_MODULE_REGISTER(LOG_MODULE_NAME);
 #include <zephyr/net/openthread.h>
 #endif
 
-#include <zephyr/drivers/interrupt_controller/riscv_plic.h>
+#include "em_system.h"
+#include "rail_types.h"
+#include "rail.h"
+#include "C:\Zephyr_Fork\modules\hal\silabs\gecko\platform\radio\rail_lib\protocol\ieee802154\rail_ieee802154.h"
+#include "pa_conversions_efr32.h"
 
-#include "ieee802154_b91.h"
+#include "ieee802154_silabs_rail.h"
 
-#include "rail_ieee802154.h"
+/* ERF32 data structure */
+static struct erf32_data data;
 
-/* B91 data structure */
-static struct b91_data data;
+/* Enum declaration */
+static efr32_state rail_state;
 
-/* Set filter PAN ID */
-static int b91_set_pan_id(uint16_t pan_id)
-{
-	uint8_t pan_id_le[B91_PAN_ID_SIZE];
+/* RAIL handler callback declaration */
+static void efr32_rail_cb(RAIL_Handle_t rail_handle, RAIL_Events_t a_events);
 
-	sys_put_le16(pan_id, pan_id_le);
-	memcpy(data.filter_pan_id, pan_id_le, B91_PAN_ID_SIZE);
+/*##### RAIL api configuration #####*/
+/*Handler configuration options */
+static RAIL_Config_t s_rail_config = {
+    .eventsCallback = &efr32_rail_cb,
+    .protocol = NULL,
+    .scheduler = NULL,
+};
 
-	return 0;
-}
+/* Macro for PA curves declaration */
+// RAIL_DECLARE_TX_POWER_VBAT_CURVES(piecewiseSegments, curvesSg, curves24Hp, curves24Lp);
 
-/* Set filter short address */
-static int b91_set_short_addr(uint16_t short_addr)
-{
-	uint8_t short_addr_le[B91_SHORT_ADDRESS_SIZE];
+/* CSMA configuration options */
+static const RAIL_CsmaConfig_t rail_csma_config = RAIL_CSMA_CONFIG_802_15_4_2003_2p4_GHz_OQPSK_CSMA;
 
-	sys_put_le16(short_addr, short_addr_le);
-	memcpy(data.filter_short_addr, short_addr_le, B91_SHORT_ADDRESS_SIZE);
+/* RAIL iee802154 configuration options */
+static const RAIL_IEEE802154_Config_t rail_ieee802154_config = {
+	.addresses = NULL,
+	.ackConfig = {
+		.enable = true,     // Turn on auto ACK for IEEE 802.15.4.
+		.ackTimeout = 672,  // See note above: 54-12 sym * 16 us/sym = 672 us.
+		.rxTransitions = {
+		.success = RAIL_RF_STATE_RX,  // Return to RX after ACK processing
+		.error = RAIL_RF_STATE_RX,    // Ignored
+		},
+		.txTransitions = {
+		.success = RAIL_RF_STATE_RX,  // Return to RX after ACK processing
+		.error = RAIL_RF_STATE_RX,    // Ignored
+		},
+	},
+	.timings = {
+		.idleToRx = 100,
+		.idleToTx = 100,
+		.rxToTx = 192,    // 12 symbols * 16 us/symbol = 192 us
+		.txToRx = 192,    // 12 symbols * 16 us/symbol = 192 us
+		.rxSearchTimeout = 0, // Not used
+		.txToRxSearchTimeout = 0, // Not used
+	},
+	.framesMask = RAIL_IEEE802154_ACCEPT_STANDARD_FRAMES,
+	.promiscuousMode = false,  // Enable format and address filtering.
+	.isPanCoordinator = false,
+	.defaultFramePendingInOutgoingAcks = false,
+};
 
-	return 0;
-}
-
-/* Set filter IEEE address */
-static int b91_set_ieee_addr(const uint8_t *ieee_addr)
-{
-	memcpy(data.filter_ieee_addr, ieee_addr, B91_IEEE_ADDRESS_SIZE);
-
-	return 0;
-}
-
-/* Filter PAN ID, short address and IEEE address */
-static bool b91_run_filter(uint8_t *rx_buffer)
-{
-	/* Check destination PAN Id */
-	if (memcmp(&rx_buffer[B91_PAN_ID_OFFSET], data.filter_pan_id,
-		   B91_PAN_ID_SIZE) != 0 &&
-	    memcmp(&rx_buffer[B91_PAN_ID_OFFSET], B91_BROADCAST_ADDRESS,
-		   B91_PAN_ID_SIZE) != 0) {
-		return false;
-	}
-
-	/* Check destination address */
-	switch (rx_buffer[B91_DEST_ADDR_TYPE_OFFSET] & B91_DEST_ADDR_TYPE_MASK) {
-	case B91_DEST_ADDR_TYPE_SHORT:
-		/* First check if the destination is broadcast */
-		/* If not broadcast, check if length and address matches */
-		if (memcmp(&rx_buffer[B91_DEST_ADDR_OFFSET], B91_BROADCAST_ADDRESS,
-			   B91_SHORT_ADDRESS_SIZE) != 0 &&
-		    memcmp(&rx_buffer[B91_DEST_ADDR_OFFSET], data.filter_short_addr,
-			   B91_SHORT_ADDRESS_SIZE) != 0) {
-			return false;
-		}
-		break;
-
-	case B91_DEST_ADDR_TYPE_IEEE:
-		/* If not broadcast, check if length and address matches */
-		if ((net_if_get_link_addr(data.iface)->len != B91_IEEE_ADDRESS_SIZE) ||
-		    memcmp(&rx_buffer[B91_DEST_ADDR_OFFSET], data.filter_ieee_addr,
-			   B91_IEEE_ADDRESS_SIZE) != 0) {
-			return false;
-		}
-		break;
-
-	default:
-		return false;
-	}
-
-	return true;
-}
 
 /* Get MAC address */
-static inline uint8_t *b91_get_mac(const struct device *dev)
+static inline uint8_t *efr32_get_mac(const struct device *dev)
 {
-	struct b91_data *b91 = dev->data;
-
-#if defined(CONFIG_IEEE802154_B91_RANDOM_MAC)
-	sys_rand_get(b91->mac_addr, sizeof(b91->mac_addr));
-
-	/*
-	 * Clear bit 0 to ensure it isn't a multicast address and set
-	 * bit 1 to indicate address is locally administered and may
-	 * not be globally unique.
-	 */
-	b91->mac_addr[0] = (b91->mac_addr[0] & ~0x01) | 0x02;
-#else
-	/* Vendor Unique Identifier */
-	b91->mac_addr[0] = 0xC4;
-	b91->mac_addr[1] = 0x19;
-	b91->mac_addr[2] = 0xD1;
-	b91->mac_addr[3] = 0x00;
-
-	/* Extended Unique Identifier */
-	b91->mac_addr[4] = CONFIG_IEEE802154_B91_MAC4;
-	b91->mac_addr[5] = CONFIG_IEEE802154_B91_MAC5;
-	b91->mac_addr[6] = CONFIG_IEEE802154_B91_MAC6;
-	b91->mac_addr[7] = CONFIG_IEEE802154_B91_MAC7;
-#endif
-
-	return b91->mac_addr;
-}
-
-/* Convert RSSI to LQI */
-static uint8_t b91_convert_rssi_to_lqi(int8_t rssi)
-{
-	uint32_t lqi32 = 0;
-
-	/* check for MIN value */
-	if (rssi < B91_RSSI_TO_LQI_MIN) {
-		return 0;
-	}
-
-	/* convert RSSI to LQI */
-	lqi32 = B91_RSSI_TO_LQI_SCALE * (rssi - B91_RSSI_TO_LQI_MIN);
-
-	/* check for MAX value */
-	if (lqi32 > 0xFF) {
-		lqi32 = 0xFF;
-	}
-
-	return (uint8_t)lqi32;
-}
-
-/* Update RSSI and LQI parameters */
-static void b91_update_rssi_and_lqi(struct net_pkt *pkt)
-{
-	int8_t rssi;
-	uint8_t lqi;
-
-	rssi = ((signed char)(data.rx_buffer
-			      [data.rx_buffer[B91_LENGTH_OFFSET] + B91_RSSI_OFFSET])) - 110;
-	lqi = b91_convert_rssi_to_lqi(rssi);
-
-	net_pkt_set_ieee802154_lqi(pkt, lqi);
-	net_pkt_set_ieee802154_rssi_dbm(pkt, rssi);
-}
-
-/* Prepare TX buffer */
-static int b91_set_tx_payload(uint8_t *payload, uint8_t payload_len)
-{
-	unsigned char rf_data_len;
-	unsigned int rf_tx_dma_len;
-
-	/* See Telink SDK Dev Handbook, AN-21010600, section 21.5.2.2. */
-	if (payload_len > (B91_TRX_LENGTH - B91_PAYLOAD_OFFSET - IEEE802154_FCS_LENGTH)) {
-		return -EINVAL;
-	}
-
-	rf_data_len = payload_len + 1;
-	rf_tx_dma_len = rf_tx_packet_dma_len(rf_data_len);
-	data.tx_buffer[0] = rf_tx_dma_len & 0xff;
-	data.tx_buffer[1] = (rf_tx_dma_len >> 8) & 0xff;
-	data.tx_buffer[2] = (rf_tx_dma_len >> 16) & 0xff;
-	data.tx_buffer[3] = (rf_tx_dma_len >> 24) & 0xff;
-	data.tx_buffer[4] = payload_len + IEEE802154_FCS_LENGTH;
-	memcpy(data.tx_buffer + B91_PAYLOAD_OFFSET, payload, payload_len);
-
-	return 0;
-}
-
-/* Enable ack handler */
-static void b91_handle_ack_en(void)
-{
-	data.ack_handler_en = true;
-}
-
-/* Disable ack handler */
-static void b91_handle_ack_dis(void)
-{
-	data.ack_handler_en = false;
-}
-
-/* Handle acknowledge packet */
-static void b91_handle_ack(void)
-{
-	struct net_pkt *ack_pkt;
-
-	/* allocate ack packet */
-	ack_pkt = net_pkt_rx_alloc_with_buffer(data.iface, B91_ACK_FRAME_LEN,
-					       AF_UNSPEC, 0, K_NO_WAIT);
-	if (!ack_pkt) {
-		LOG_ERR("No free packet available.");
-		return;
-	}
-
-	/* update packet data */
-	if (net_pkt_write(ack_pkt, data.rx_buffer + B91_PAYLOAD_OFFSET,
-			  B91_ACK_FRAME_LEN) < 0) {
-		LOG_ERR("Failed to write to a packet.");
-		goto out;
-	}
-
-	/* update RSSI and LQI */
-	b91_update_rssi_and_lqi(ack_pkt);
-
-	/* init net cursor */
-	net_pkt_cursor_init(ack_pkt);
-
-	/* handle ack */
-	if (ieee802154_handle_ack(data.iface, ack_pkt) != NET_OK) {
-		LOG_INF("ACK packet not handled - releasing.");
-	}
-
-	/* release ack_wait semaphore */
-	k_sem_give(&data.ack_wait);
-
-out:
-	net_pkt_unref(ack_pkt);
-}
-
-/* Send acknowledge packet */
-static void b91_send_ack(uint8_t seq_num)
-{
-	uint8_t ack_buf[] = { B91_ACK_TYPE, 0, seq_num };
-
-	if (b91_set_tx_payload(ack_buf, sizeof(ack_buf))) {
-		return;
-	}
-
-	rf_set_txmode();
-	delay_us(CONFIG_IEEE802154_B91_SET_TXRX_DELAY_US);
-	rf_tx_pkt(data.tx_buffer);
-}
-
-/* RX IRQ handler */
-static void b91_rf_rx_isr(void)
-{
-	uint8_t status;
-	uint8_t length;
-	uint8_t *payload;
-	struct net_pkt *pkt;
-
-	/* disable DMA and clear IRQ flag */
-	dma_chn_dis(DMA1);
-	rf_clr_irq_status(FLD_RF_IRQ_RX);
-
-	/* check CRC */
-	if (rf_zigbee_packet_crc_ok(data.rx_buffer)) {
-		/* get payload length */
-		if (IS_ENABLED(CONFIG_IEEE802154_RAW_MODE) ||
-		    IS_ENABLED(CONFIG_NET_L2_OPENTHREAD)) {
-			length = data.rx_buffer[B91_LENGTH_OFFSET];
-		} else {
-			length = data.rx_buffer[B91_LENGTH_OFFSET] - B91_FCS_LENGTH;
-		}
-
-		/* check length */
-		if ((length < B91_PAYLOAD_MIN) || (length > B91_PAYLOAD_MAX)) {
-			LOG_ERR("Invalid length\n");
-			goto exit;
-		}
-
-		/* get payload */
-		payload = (uint8_t *)(data.rx_buffer + B91_PAYLOAD_OFFSET);
-
-		/* handle acknowledge packet if enabled */
-		if ((length == (B91_ACK_FRAME_LEN + B91_FCS_LENGTH)) &&
-		    ((payload[B91_FRAME_TYPE_OFFSET] & B91_FRAME_TYPE_MASK) == B91_ACK_TYPE)) {
-			if (data.ack_handler_en) {
-				b91_handle_ack();
-			}
-			goto exit;
-		}
-
-		/* run filter (check PAN ID and destination address) */
-		if (b91_run_filter(payload) == false) {
-			LOG_DBG("Packet received is not addressed to me");
-			goto exit;
-		}
-
-		/* send ack if requested */
-		if (payload[B91_FRAME_TYPE_OFFSET] & B91_ACK_REQUEST) {
-			b91_send_ack(payload[B91_DSN_OFFSET]);
-		}
-
-		/* get packet pointer from NET stack */
-		pkt = net_pkt_rx_alloc_with_buffer(data.iface, length, AF_UNSPEC, 0, K_NO_WAIT);
-		if (!pkt) {
-			LOG_ERR("No pkt available");
-			goto exit;
-		}
-
-		/* update packet data */
-		if (net_pkt_write(pkt, payload, length)) {
-			LOG_ERR("Failed to write to a packet.");
-			net_pkt_unref(pkt);
-			goto exit;
-		}
-
-		/* update RSSI and LQI parameters */
-		b91_update_rssi_and_lqi(pkt);
-
-		/* transfer data to NET stack */
-		status = net_recv_data(data.iface, pkt);
-		if (status < 0) {
-			LOG_ERR("RCV Packet dropped by NET stack: %d", status);
-			net_pkt_unref(pkt);
-		}
-	}
-
-exit:
-	dma_chn_en(DMA1);
-}
-
-/* TX IRQ handler */
-static void b91_rf_tx_isr(void)
-{
-	/* clear irq status */
-	rf_clr_irq_status(FLD_RF_IRQ_TX);
-
-	/* release tx semaphore */
-	k_sem_give(&data.tx_wait);
-
-	/* set to rx mode */
-	rf_set_rxmode();
-}
-
-/* IRQ handler */
-static void b91_rf_isr(void)
-{
-	if (rf_get_irq_status(FLD_RF_IRQ_RX)) {
-		b91_rf_rx_isr();
-	} else if (rf_get_irq_status(FLD_RF_IRQ_TX)) {
-		b91_rf_tx_isr();
-	} else {
-		rf_clr_irq_status(FLD_RF_IRQ_ALL);
-	}
-}
-
-/* Driver initialization */
-static int b91_init(const struct device *dev)
-{
-	struct b91_data *b91 = dev->data;
-
-	/* init semaphores */
-	k_sem_init(&b91->tx_wait, 0, 1);
-	k_sem_init(&b91->ack_wait, 0, 1);
-
-	/* init rf module */
-	rf_mode_init();
-	rf_set_zigbee_250K_mode();
-	rf_set_tx_dma(2, B91_TRX_LENGTH);
-	rf_set_rx_dma(data.rx_buffer, 3, B91_TRX_LENGTH);
-	rf_set_rxmode();
-
-	/* init IRQs */
-	IRQ_CONNECT(DT_INST_IRQN(0), DT_INST_IRQ(0, priority), b91_rf_isr, 0, 0);
-	riscv_plic_irq_enable(DT_INST_IRQN(0));
-	riscv_plic_set_priority(DT_INST_IRQN(0), DT_INST_IRQ(0, priority));
-	rf_set_irq_mask(FLD_RF_IRQ_RX | FLD_RF_IRQ_TX);
-
-	/* init data variables */
-	data.is_started = true;
-	data.ack_handler_en = false;
-	data.current_channel = 0;
-
-	return 0;
+	uint64_t uniqueID = SYSTEM_GetUnique();
+    uint8_t *mac = (uint8_t *)&uniqueID;
+    return mac;
 }
 
 /* API implementation: iface_init */
-static void b91_iface_init(struct net_if *iface)
+static void efr32_iface_init(struct net_if *iface)
 {
 	const struct device *dev = net_if_get_device(iface);
-	struct b91_data *b91 = dev->data;
-	uint8_t *mac = b91_get_mac(dev);
+	struct erf32_data *efr32 = dev->data;
+	uint8_t *mac = efr32_get_mac(dev);
 
-	net_if_set_link_addr(iface, mac, B91_IEEE_ADDRESS_SIZE, NET_LINK_IEEE802154);
-
-	b91->iface = iface;
-
+	net_if_set_link_addr(iface, mac, ERF32_IEEE_ADDRESS_SIZE, NET_LINK_IEEE802154);
+	efr32->iface = iface;
 	ieee802154_init(iface);
 }
 
 /* API implementation: get_capabilities */
-static enum ieee802154_hw_caps b91_get_capabilities(const struct device *dev)
+static enum ieee802154_hw_caps efr32_get_capabilities(const struct device *dev)
 {
 	ARG_UNUSED(dev);
 
-	return IEEE802154_HW_FCS | IEEE802154_HW_FILTER |
-	       IEEE802154_HW_TX_RX_ACK | IEEE802154_HW_RX_TX_ACK;
+	return IEEE802154_HW_FCS |
+           IEEE802154_HW_FILTER |
+           IEEE802154_HW_TX_RX_ACK |
+           IEEE802154_HW_CSMA;
 }
 
 /* API implementation: cca */
-static int b91_cca(const struct device *dev)
+static int efr32_cca(const struct device *dev)
 {
-	ARG_UNUSED(dev);
-
-	unsigned int t1 = stimer_get_tick();
-
-	while (!clock_time_exceed(t1, B91_CCA_TIME_MAX_US)) {
-		if (rf_get_rssi() < CONFIG_IEEE802154_B91_CCA_RSSI_THRESHOLD) {
-			return 0;
-		}
-	}
-
-	return -EBUSY;
-}
-
-/* API implementation: set_channel */
-static int b91_set_channel(const struct device *dev, uint16_t channel)
-{
-	ARG_UNUSED(dev);
-
-	if (channel > 26) {
-		return -EINVAL;
-	}
-
-	if (channel < 11) {
-		return -ENOTSUP;
-	}
-
-	if (data.current_channel != channel) {
-		data.current_channel = channel;
-		rf_set_chn(B91_LOGIC_CHANNEL_TO_PHYSICAL(channel));
-		rf_set_rxmode();
-	}
-
+	// RAIL handles this in tx()
 	return 0;
 }
 
-/* API implementation: filter */
-static int b91_filter(const struct device *dev,
-		      bool set,
-		      enum ieee802154_filter_type type,
-		      const struct ieee802154_filter *filter)
+/* API implementation: set_channel */
+static int efr32_set_channel(const struct device *dev, uint16_t channel)
 {
+    RAIL_Status_t status;
+	struct erf32_data *efr32 = dev->data;
+
+    // Set the radio channel
+    status = RAIL_PrepareChannel(efr32->rail_handle, channel);
+
+    if (status != RAIL_STATUS_NO_ERROR) {
+        return -EIO;
+    }
+
+	efr32->channel = channel;
+
+    return 0;
+}
+
+/* API implementation: filter */
+static int efr32_filter(const struct device *dev,
+		      			bool set,
+		      			enum ieee802154_filter_type type,
+		      			const struct ieee802154_filter *filter)
+{
+	LOG_DBG("Applying filter %u", type);
+
+	// RAIL status
+	RAIL_Status_t status = RAIL_STATUS_NO_ERROR;
+	struct erf32_data *efr32 = dev->data;
+
 	if (!set) {
 		return -ENOTSUP;
 	}
 
 	if (type == IEEE802154_FILTER_TYPE_IEEE_ADDR) {
-		return b91_set_ieee_addr(filter->ieee_addr);
+		status = RAIL_IEEE802154_SetLongAddress(efr32->rail_handle, 
+												filter->ieee_addr, 
+												DEFAULT_ADDRESS_INDEX);
 	} else if (type == IEEE802154_FILTER_TYPE_SHORT_ADDR) {
-		return b91_set_short_addr(filter->short_addr);
+		status = RAIL_IEEE802154_SetShortAddress(efr32->rail_handle, 
+												 filter->short_addr, 
+												 DEFAULT_ADDRESS_INDEX);
 	} else if (type == IEEE802154_FILTER_TYPE_PAN_ID) {
-		return b91_set_pan_id(filter->pan_id);
+		status = RAIL_IEEE802154_SetPanId(efr32->rail_handle, 
+										  filter->pan_id, 
+										  DEFAULT_ADDRESS_INDEX);
 	}
-
-	return -ENOTSUP;
+	
+	if (status != RAIL_STATUS_NO_ERROR)
+	{
+		LOG_ERR("Error setting address via RAIL");
+		return -EIO;
+	}
+	
+	return 0;
 }
 
 /* API implementation: set_txpower */
-static int b91_set_txpower(const struct device *dev, int16_t dbm)
+static int efr32_set_txpower(const struct device *dev, int16_t dbm)
 {
-	ARG_UNUSED(dev);
-
-	/* check for supported Min/Max range */
-	if (dbm < B91_TX_POWER_MIN) {
-		dbm = B91_TX_POWER_MIN;
-	} else if (dbm > B91_TX_POWER_MAX) {
-		dbm = B91_TX_POWER_MAX;
-	}
-
-	/* set TX power */
-	rf_set_power_level(b91_tx_pwr_lt[dbm - B91_TX_POWER_MIN]);
+	// RAIL status
+	RAIL_Status_t status = RAIL_STATUS_NO_ERROR;
+	// Init erf32 data struct
+	struct erf32_data *efr32 = dev->data;
+	// RAIL variable to store dbm
+	// RAIL expects deci dBm
+	RAIL_TxPower_t power = DBM_TO_DECI_DBM(dbm);
+	
+	// Set new dbm value
+	status = RAIL_SetTxPowerDbm (efr32->rail_handle, power);
+	if (status != RAIL_STATUS_NO_ERROR) {
+        return -EIO;
+    }
 
 	return 0;
 }
 
 /* API implementation: start */
-static int b91_start(const struct device *dev)
+static int efr32_start(const struct device *dev)
 {
-	ARG_UNUSED(dev);
+    ARG_UNUSED(dev);
+    
+    rail_state = EFR32_STATE_SLEEP;
 
-	/* check if RF is already started */
-	if (!data.is_started) {
-		rf_set_rxmode();
-		delay_us(CONFIG_IEEE802154_B91_SET_TXRX_DELAY_US);
-		riscv_plic_irq_enable(DT_INST_IRQN(0));
-		data.is_started = true;
-	}
+    LOG_DBG("EFR32 802154 radio started");
 
-	return 0;
+    return 0;
 }
 
 /* API implementation: stop */
-static int b91_stop(const struct device *dev)
+static int efr32_stop(const struct device *dev)
 {
-	ARG_UNUSED(dev);
+#if 0
+    struct efr32_context *efr32 = dev->driver_data;
+    ARG_UNUSED(efr32);
 
-	/* check if RF is already stopped */
-	if (data.is_started) {
-		riscv_plic_irq_disable(DT_INST_IRQN(0));
-		rf_set_tx_rx_off();
-		delay_us(CONFIG_IEEE802154_B91_SET_TXRX_DELAY_US);
-		data.is_started = false;
+    rail_state = EFR32_STATE_DISABLED;
+
+    LOG_DBG("EFR32 802154 radio stopped");
+
+    return 0;
+#else
+	// RAIL status
+	RAIL_Status_t status = RAIL_STATUS_NO_ERROR;
+	// Init erf32 data struct
+	struct erf32_data *efr32 = dev->data;
+
+	if (RAIL_IsInitialized())
+	{
+		return -EALREADY;
 	}
 
+	status = RAIL_IEEE802154_Deinit(efr32->rail_handle);
+	if (status != RAIL_STATUS_NO_ERROR) {
+        return -EIO;
+    }
+
 	return 0;
+#endif
 }
 
 /* API implementation: tx */
-static int b91_tx(const struct device *dev,
-		  enum ieee802154_tx_mode mode,
-		  struct net_pkt *pkt,
-		  struct net_buf *frag)
+static int efr32_tx(const struct device *dev,
+		  			enum ieee802154_tx_mode mode,
+		  			struct net_pkt *pkt,
+		  			struct net_buf *frag)
 {
-	ARG_UNUSED(pkt);
+	struct erf32_data *efr32 = dev->data;
 
-	int status;
-	struct b91_data *b91 = dev->data;
+	RAIL_TxOptions_t txOptions = RAIL_TX_OPTIONS_DEFAULT;
+    RAIL_Status_t status = RAIL_STATUS_NO_ERROR;
+	uint16_t number_written_bytes = 0;
+    uint16_t payload_length = frag->len;
+    uint8_t *payload = frag->data;
 
-	/* check for supported mode */
-	if (mode != IEEE802154_TX_MODE_DIRECT) {
-		LOG_DBG("TX mode %d not supported", mode);
-		return -ENOTSUP;
-	}
+	LOG_DBG("rx %p (%u)", payload, payload_length);
+	efr32->tx_success = false;
 
-	/* prepare tx buffer */
-	status = b91_set_tx_payload(frag->data, frag->len);
-	if (status) {
-		return status;
-	}
+    memcpy(efr32->tx_buffer + 1, payload, payload_length);
+    efr32->tx_buffer[0] = payload_length + EFR32_FCS_LENGTH;
 
-	/* reset semaphores */
-	k_sem_reset(&b91->tx_wait);
-	k_sem_reset(&b91->ack_wait);
+    /* Reset semaphore in case ACK was received after timeout */
+    k_sem_reset(&efr32->tx_wait);
 
-	/* start transmission */
-	rf_set_txmode();
-	delay_us(CONFIG_IEEE802154_B91_SET_TXRX_DELAY_US);
-	rf_tx_pkt(data.tx_buffer);
+	// Load data into FIFO
+    number_written_bytes = RAIL_WriteTxFifo(efr32->rail_handle, payload, payload_length, true);
+    // Begin transmitting
+    status = RAIL_StartCcaCsmaTx(efr32->rail_handle, efr32->channel, txOptions, &rail_csma_config, NULL);
+    if (status != RAIL_STATUS_NO_ERROR) {
+		efr32->tx_success = 0;
+        return -EIO;
+    }
 
-	/* wait for tx done */
-	status = k_sem_take(&b91->tx_wait, K_MSEC(B91_TX_WAIT_TIME_MS));
-	if (status != 0) {
-		rf_set_rxmode();
-		return -EIO;
-	}
+	LOG_DBG("Sending frame: channel=%d, written=%u", efr32->channel, number_written_bytes);
+	k_sem_give(&efr32->rx_wait);
+	LOG_DBG("Result: %d", efr32->tx_success);
+    return efr32->tx_success ? 0 : -EBUSY;
+}
 
-	/* wait for ACK if requested */
-	if (frag->data[B91_FRAME_TYPE_OFFSET] & B91_ACK_REQUEST) {
-		b91_handle_ack_en();
-		status = k_sem_take(&b91->ack_wait, K_MSEC(B91_ACK_WAIT_TIME_MS));
-		b91_handle_ack_dis();
-	}
+static void efr32_rx(int arg)
+{
+    struct device *dev = INT_TO_POINTER(arg);
+    struct erf32_data *efr32 = dev->data;
 
-	return status;
+    while (1)
+    {
+        LOG_DBG("Waiting for frame");
+        k_sem_take(&efr32->rx_wait, K_FOREVER);
+
+		LOG_DBG("Frame received!");
+
+        RAIL_Idle(efr32->rail_handle, RAIL_IDLE_ABORT, true);
+        RAIL_StartRx(efr32->rail_handle, efr32->channel, NULL);
+    }
 }
 
 /* API implementation: ed_scan */
-static int b91_ed_scan(const struct device *dev, uint16_t duration,
+static int efr32_ed_scan(const struct device *dev, uint16_t duration,
 		       energy_scan_done_cb_t done_cb)
 {
 	ARG_UNUSED(dev);
@@ -588,51 +318,224 @@ static int b91_ed_scan(const struct device *dev, uint16_t duration,
 }
 
 /* API implementation: configure */
-static int silabs_rail_configure(const struct device *dev,
+static int efr32_configure(const struct device *dev,
 			 enum ieee802154_config_type type,
 			 const struct ieee802154_config *config)
 {
 	ARG_UNUSED(dev);
 	ARG_UNUSED(type);
 	ARG_UNUSED(config);
-	if (type == IEEE802154_CONFIG_RX_ON_WHEN_IDLE) {
-		SILABS_CALL(config->rx_on_when_idle)
-        return 0;
-    }
 
-    /* configure not supported */
+	/* configure not supported */
 
-    return -ENOTSUP;
+	return -ENOTSUP;
 }
-
-/* driver-allocated attribute memory - constant across all driver instances */
-IEEE802154_DEFINE_PHY_SUPPORTED_CHANNELS(drv_attr, 11, 26);
 
 /* API implementation: attr_get */
-static int b91_attr_get(const struct device *dev, enum ieee802154_attr attr,
+static int efr32_attr_get(const struct device *dev, enum ieee802154_attr attr,
 			struct ieee802154_attr_value *value)
 {
-	ARG_UNUSED(dev);
-
-	return ieee802154_attr_get_channel_page_and_range(
-		attr, IEEE802154_ATTR_PHY_CHANNEL_PAGE_ZERO_OQPSK_2450_BPSK_868_915,
-		&drv_attr.phy_supported_channels, value);
+	/* Do nothing - mock up */
+	return 0;
 }
 
+/* Driver initialization */
+static int efr32_init(const struct device *dev)
+{
+    struct erf32_data *efr32 = dev->data;
+    RAIL_Status_t status = RAIL_STATUS_NO_ERROR;
+
+    static const RAIL_DataConfig_t rail_data_config = {
+        TX_PACKET_DATA,
+        RX_PACKET_DATA,
+        PACKET_MODE,
+        PACKET_MODE,
+    };
+
+	// A macro RAIL_TX_POWER_CURVES_CONFIG is used as the curve
+	// structures used by the provided conversion functions.
+	RAIL_DECLARE_TX_POWER_VBAT_CURVES_ALT;
+	const RAIL_TxPowerCurvesConfigAlt_t tx_power_curves_config = RAIL_DECLARE_TX_POWER_CURVES_CONFIG_ALT;
+
+
+    // Switch to the 2.4GHz HP PA powered off the 1.8V DCDC connection
+  	RAIL_TxPowerConfig_t railTxPowerConfig = {
+		RAIL_TX_POWER_MODE_2P4GIG_HP, // 2.4GHz HP Power Amplifier mode
+		1800,                         // 1.8V vPA voltage for DCDC connection
+		10                            // Desired ramp time in us
+  	};
+
+    efr32->rail_handle = RAIL_Init(&s_rail_config, NULL);
+	efr32->packet_handle = RAIL_RX_PACKET_HANDLE_INVALID;
+
+    k_sem_init(&efr32->rx_wait, 0, 1);
+    k_sem_init(&efr32->tx_wait, 0, 1);
+
+    if (efr32->rail_handle == NULL)
+    {
+        LOG_ERR("Unable to init");
+        return -EIO;
+    }
+
+    status = RAIL_ConfigData(efr32->rail_handle, &rail_data_config);
+    if (status != RAIL_STATUS_NO_ERROR)
+    {
+        LOG_ERR("Error with config data.");
+        return -EIO;
+    }
+
+
+    status = RAIL_ConfigCal(efr32->rail_handle, RAIL_CAL_ALL);
+    if (status != RAIL_STATUS_NO_ERROR)
+    {
+        LOG_ERR("Error with config cal.");
+        return -EIO;
+    }
+
+    status = RAIL_IEEE802154_Config2p4GHzRadio(efr32->rail_handle);
+    if (status != RAIL_STATUS_NO_ERROR)
+    {
+        return -EIO;
+    }
+
+    status = RAIL_IEEE802154_Init(efr32->rail_handle, &rail_ieee802154_config);
+    if (status != RAIL_STATUS_NO_ERROR)
+    {
+        return -EIO;
+    }
+
+    RAIL_SetTxFifo(efr32->rail_handle, efr32->tx_buffer, 0, (uint16_t) ERF32_TX_BUFFER_LENGTH);
+	status = RAIL_SetRxFifo(efr32->rail_handle, efr32->rx_buffer, &efr32->rx_buffer_size);
+	if (status != RAIL_STATUS_NO_ERROR)
+    {
+        return -EIO;
+    }
+	
+	RAIL_SetTxFifoThreshold(efr32->rail_handle, (size_t) (0.9 * ERF32_TX_BUFFER_LENGTH));
+	RAIL_SetRxFifoThreshold(efr32->rail_handle, (size_t) (0.9 * ERF32_RX_BUFFER_LENGTH));
+
+    status = RAIL_ConfigEvents(efr32->rail_handle, RAIL_EVENTS_ALL,
+		RAIL_EVENTS_RX_COMPLETION
+		| RAIL_EVENTS_TX_COMPLETION
+		| RAIL_EVENTS_TXACK_COMPLETION
+		| RAIL_EVENT_RX_ACK_TIMEOUT
+		| RAIL_EVENT_TX_FIFO_ALMOST_EMPTY
+		| RAIL_EVENT_RX_FIFO_ALMOST_FULL
+		| RAIL_EVENT_IEEE802154_DATA_REQUEST_COMMAND
+		| RAIL_EVENT_CAL_NEEDED
+	);
+    if (status != RAIL_STATUS_NO_ERROR)
+    {
+        return -EIO;
+    }
+
+    status = RAIL_InitTxPowerCurvesAlt(&tx_power_curves_config);
+
+    if (status != RAIL_STATUS_NO_ERROR)
+    {
+        return -EIO;
+    }
+
+    status = RAIL_ConfigTxPower(efr32->rail_handle, &railTxPowerConfig);
+
+    efr32_set_txpower(dev, 10);
+    
+    k_thread_create(&efr32->rx_thread, efr32->rx_stack,
+                    CONFIG_IEEE802154_EFR32_RX_STACK_SIZE,
+                    (k_thread_entry_t)efr32_rx,
+                    efr32, NULL, NULL, K_PRIO_COOP(2), 0, K_NO_WAIT);
+
+    LOG_DBG("Init done!");
+    return 0;
+}
+
+static void efr32_rail_cb(RAIL_Handle_t rail_handle, RAIL_Events_t events)
+{
+    LOG_DBG("Processing events 0x%llX", events);
+
+	if (events & RAIL_EVENT_RX_PACKET_RECEIVED) {
+		LOG_DBG("Received packet frame");
+		//RAIL_RxPacketHandle_t packetHandle = RAIL_RX_PACKET_HANDLE_INVALID;
+		//RAIL_RxPacketInfo_t packetInfo;
+		//RAIL_RxPacketDetails_t packetDetails;
+		//RAIL_Status_t status;
+		//uint16_t length;
+		//packetHandle = RAIL_GetRxPacketInfo(efr32_data.rail_handle, RAIL_RX_PACKET_HANDLE_OLDEST, &packetInfo);
+	}
+	if (events & RAIL_EVENT_RX_PACKET_ABORTED) {
+		LOG_DBG("RX packet aborted");
+	}
+	if (events & RAIL_EVENT_RX_FRAME_ERROR) {
+		LOG_DBG("RX frame error");
+	}
+	if (events & RAIL_EVENT_RX_FIFO_OVERFLOW) {
+		LOG_DBG("RX FIFO overflow");
+	}
+	if (events & RAIL_EVENT_RX_ADDRESS_FILTERED) {
+		LOG_DBG("RX Address filtered");
+	}
+    	if (events & RAIL_EVENT_TX_PACKET_SENT) {
+		LOG_DBG("TX packet sent");
+	}
+	if (events & RAIL_EVENT_TX_ABORTED) {
+		LOG_DBG("TX was aborted");
+	}
+	if (events & RAIL_EVENT_TX_BLOCKED) {
+		LOG_DBG("TX is blocked");
+	}
+	if (events & RAIL_EVENT_TX_UNDERFLOW) {
+		LOG_DBG("TX is underflow");
+	}
+	if (events & RAIL_EVENT_TX_CHANNEL_BUSY) {
+		LOG_DBG("TX channel busy");
+	}
+
+	if (events & RAIL_EVENT_TXACK_PACKET_SENT) {
+		LOG_DBG("TXACK packet sent");
+	}
+	if (events & RAIL_EVENT_TXACK_ABORTED) {
+		LOG_DBG("TXACK aborted");
+	}
+    	if (events & RAIL_EVENT_TXACK_BLOCKED) {
+		LOG_DBG("TXACK blocked");
+	}
+	if (events & RAIL_EVENT_TXACK_UNDERFLOW) {
+		LOG_DBG("TXACK underflow");
+	}
+
+    if (events & RAIL_EVENT_TX_FIFO_ALMOST_EMPTY) {
+        LOG_DBG("TX FIFO almost empty");
+	}
+	if (events & RAIL_EVENT_RX_FIFO_ALMOST_FULL) {
+		LOG_DBG("RX FIFO almost full");
+	}
+	if (events & RAIL_EVENT_RX_ACK_TIMEOUT) {
+		LOG_DBG("RX AutoAck occurred");
+	}
+	if (events & RAIL_EVENT_CAL_NEEDED) {
+		LOG_DBG("Calibration needed");
+		RAIL_Calibrate(rail_handle, NULL, RAIL_CAL_ALL_PENDING);
+	}
+	if (events & RAIL_EVENT_IEEE802154_DATA_REQUEST_COMMAND) {
+		LOG_DBG("IEEE802154 Data request command");
+	}
+}
+
+
 /* IEEE802154 driver APIs structure */
-static const struct ieee802154_radio_api b91_radio_api = {
-	.iface_api.init = b91_iface_init,
-	.get_capabilities = b91_get_capabilities,
-	.cca = b91_cca,
-	.set_channel = b91_set_channel,
-	.filter = b91_filter,
-	.set_txpower = b91_set_txpower,
-	.start = b91_start,
-	.stop = b91_stop,
-	.tx = b91_tx,
-	.ed_scan = b91_ed_scan,
-	.configure = silabs_rail_configure,
-	.attr_get = b91_attr_get,
+static const struct ieee802154_radio_api efr32_radio_api = {
+	.iface_api.init = efr32_iface_init,
+	.get_capabilities = efr32_get_capabilities,
+	.cca = efr32_cca,
+	.set_channel = efr32_set_channel,
+	.filter = efr32_filter,
+	.set_txpower = efr32_set_txpower,
+	.start = efr32_start,
+	.stop = efr32_stop,
+	.tx = efr32_tx,
+	.ed_scan = efr32_ed_scan,
+	.configure = efr32_configure,
+	.attr_get = efr32_attr_get,
 };
 
 #if defined(CONFIG_NET_L2_IEEE802154)
@@ -648,11 +551,11 @@ static const struct ieee802154_radio_api b91_radio_api = {
 
 /* IEEE802154 driver registration */
 #if defined(CONFIG_NET_L2_IEEE802154) || defined(CONFIG_NET_L2_OPENTHREAD)
-NET_DEVICE_DT_INST_DEFINE(0, b91_init, NULL, &data, NULL,
-			  CONFIG_IEEE802154_B91_INIT_PRIO,
-			  &b91_radio_api, L2, L2_CTX_TYPE, MTU);
+NET_DEVICE_DT_INST_DEFINE(0, efr32_init, NULL, &data, NULL,
+			  CONFIG_IEEE802154_SILABS_RAIL_INIT_PRIO,
+			  &efr32_radio_api, L2, L2_CTX_TYPE, MTU);
 #else
-DEVICE_DT_INST_DEFINE(0, b91_init, NULL, &data, NULL,
-		      POST_KERNEL, CONFIG_IEEE802154_B91_INIT_PRIO,
-		      &b91_radio_api);
+DEVICE_DT_INST_DEFINE(0, efr32_init, NULL, &data, NULL,
+		      POST_KERNEL, CONFIG_IEEE802154_SILABS_RAIL_INIT_PRIO,
+		      &efr32_radio_api);
 #endif

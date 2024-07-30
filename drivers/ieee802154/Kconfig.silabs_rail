@@ -20,6 +20,16 @@ config IEEE802154_SILABS_RAIL_INIT_PRIO
 
 config IEEE802154_RAIL_LIB_PATH
         string "Path to Silicon Labs RAIL library"
+		default "C:/Zephyr_Fork/silabs_hal_lib"
         help
           Path to the Silicon Labs RAIL library.
+
+config IEEE802154_EFR32_RX_STACK_SIZE
+	int "Driver's internal RX thread stack size"
+	default 6400
+	help
+	  This option sets the driver's stack size for its internal RX thread.
+	  The default value should be sufficient, but in case it proves to be
+	  a too little one, this option makes it easy to play with the size.
+
 endif

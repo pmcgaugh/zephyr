@@ -216,16 +216,18 @@
 
     rail: rail {
         compatible = "silabs,rail";
-        status = "disabled";
+        status = "okay";
         
         ieee802154: ieee802154{
-            compatible = "silabs,rail-802154";
+            compatible = "silabs,rail-ieee802154";
             status = "disabled";
         };
+		/*
         bluetooth: bluetooth{
             compatible = "silabs,rail-ble";
             status = "disabled";
         };
+		*/
     };
 
 	bt_hci_silabs: bt_hci_silabs {
