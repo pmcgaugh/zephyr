@@ -32,8 +32,9 @@ LOG_MODULE_REGISTER(LOG_MODULE_NAME);
 #include "em_system.h"
 #include "rail_types.h"
 #include "rail.h"
-#include "C:\Zephyr_Fork\modules\hal\silabs\gecko\platform\radio\rail_lib\protocol\ieee802154\rail_ieee802154.h"
+#include "rail_ieee802154.h"
 #include "pa_conversions_efr32.h"
+#include "sl_rail_util_pa_config.h"
 
 #include "ieee802154_silabs_rail.h"
 
@@ -54,40 +55,8 @@ static RAIL_Config_t s_rail_config = {
     .scheduler = NULL,
 };
 
-/* Macro for PA curves declaration */
-// RAIL_DECLARE_TX_POWER_VBAT_CURVES(piecewiseSegments, curvesSg, curves24Hp, curves24Lp);
-
 /* CSMA configuration options */
 static const RAIL_CsmaConfig_t rail_csma_config = RAIL_CSMA_CONFIG_802_15_4_2003_2p4_GHz_OQPSK_CSMA;
-
-/* RAIL iee802154 configuration options */
-static const RAIL_IEEE802154_Config_t rail_ieee802154_config = {
-	.addresses = NULL,
-	.ackConfig = {
-		.enable = true,     // Turn on auto ACK for IEEE 802.15.4.
-		.ackTimeout = 672,  // See note above: 54-12 sym * 16 us/sym = 672 us.
-		.rxTransitions = {
-		.success = RAIL_RF_STATE_RX,  // Return to RX after ACK processing
-		.error = RAIL_RF_STATE_RX,    // Ignored
-		},
-		.txTransitions = {
-		.success = RAIL_RF_STATE_RX,  // Return to RX after ACK processing
-		.error = RAIL_RF_STATE_RX,    // Ignored
-		},
-	},
-	.timings = {
-		.idleToRx = 100,
-		.idleToTx = 100,
-		.rxToTx = 192,    // 12 symbols * 16 us/symbol = 192 us
-		.txToRx = 192,    // 12 symbols * 16 us/symbol = 192 us
-		.rxSearchTimeout = 0, // Not used
-		.txToRxSearchTimeout = 0, // Not used
-	},
-	.framesMask = RAIL_IEEE802154_ACCEPT_STANDARD_FRAMES,
-	.promiscuousMode = false,  // Enable format and address filtering.
-	.isPanCoordinator = false,
-	.defaultFramePendingInOutgoingAcks = false,
-};
 
 
 /* Get MAC address */
@@ -235,10 +204,11 @@ static int efr32_stop(const struct device *dev)
 	// Init erf32 data struct
 	struct erf32_data *efr32 = dev->data;
 
-	if (RAIL_IsInitialized())
-	{
-		return -EALREADY;
-	}
+	RAIL_Idle(efr32->rail_handle, RAIL_IDLE_ABORT, true);
+	status = RAIL_ConfigEvents(efr32->rail_handle, RAIL_EVENTS_ALL, 0);
+	if (status != RAIL_STATUS_NO_ERROR) {
+        return -EIO;
+    }
 
 	status = RAIL_IEEE802154_Deinit(efr32->rail_handle);
 	if (status != RAIL_STATUS_NO_ERROR) {
@@ -339,25 +309,68 @@ static int efr32_attr_get(const struct device *dev, enum ieee802154_attr attr,
 	return 0;
 }
 
+static RAIL_Status_t efr32_config_ieee802154_2p4ghz(RAIL_Handle_t handle){
+	RAIL_Status_t status;
+  RAIL_IEEE802154_Config_t config = {
+    .addresses = NULL,
+    .ackConfig = {
+      .enable = SL_RAIL_UTIL_PROTOCOL_IEEE802154_2P4GHZ_AUTO_ACK_ENABLE,
+      .ackTimeout = SL_RAIL_UTIL_PROTOCOL_IEEE802154_2P4GHZ_AUTO_ACK_TIMEOUT_US,
+      .rxTransitions = {
+        .success = SL_RAIL_UTIL_PROTOCOL_IEEE802154_2P4GHZ_AUTO_ACK_RX_TRANSITION_STATE,
+        .error = RAIL_RF_STATE_IDLE // this parameter ignored
+      },
+      .txTransitions = {
+        .success = SL_RAIL_UTIL_PROTOCOL_IEEE802154_2P4GHZ_AUTO_ACK_TX_TRANSITION_STATE,
+        .error = RAIL_RF_STATE_IDLE // this parameter ignored
+      }
+    },
+    .timings = {
+      .idleToTx = SL_RAIL_UTIL_PROTOCOL_IEEE802154_2P4GHZ_TIMING_IDLE_TO_TX_US,
+      .idleToRx = SL_RAIL_UTIL_PROTOCOL_IEEE802154_2P4GHZ_TIMING_IDLE_TO_RX_US,
+      .rxToTx = SL_RAIL_UTIL_PROTOCOL_IEEE802154_2P4GHZ_TIMING_RX_TO_TX_US,
+      // Make txToRx slightly lower than desired to make sure we get to
+      // RX in time.
+      .txToRx = SL_RAIL_UTIL_PROTOCOL_IEEE802154_2P4GHZ_TIMING_TX_TO_RX_US,
+      .rxSearchTimeout = SL_RAIL_UTIL_PROTOCOL_IEEE802154_2P4GHZ_TIMING_RX_SEARCH_TIMEOUT_AFTER_IDLE_ENABLE
+                         ? SL_RAIL_UTIL_PROTOCOL_IEEE802154_2P4GHZ_TIMING_RX_SEARCH_TIMEOUT_AFTER_IDLE_US
+                         : 0,
+      .txToRxSearchTimeout = SL_RAIL_UTIL_PROTOCOL_IEEE802154_2P4GHZ_TIMING_RX_SEARCH_TIMEOUT_AFTER_TX_ENABLE
+                             ? SL_RAIL_UTIL_PROTOCOL_IEEE802154_2P4GHZ_TIMING_RX_SEARCH_TIMEOUT_AFTER_TX_US
+                             : 0
+    },
+    .framesMask = 0U // enable appropriate mask bits
+                  | (SL_RAIL_UTIL_PROTOCOL_IEEE802154_2P4GHZ_ACCEPT_BEACON_FRAME_ENABLE
+                     ? RAIL_IEEE802154_ACCEPT_BEACON_FRAMES : 0U)
+                  | (SL_RAIL_UTIL_PROTOCOL_IEEE802154_2P4GHZ_ACCEPT_DATA_FRAME_ENABLE
+                     ? RAIL_IEEE802154_ACCEPT_DATA_FRAMES : 0U)
+                  | (SL_RAIL_UTIL_PROTOCOL_IEEE802154_2P4GHZ_ACCEPT_ACK_FRAME_ENABLE
+                     ? RAIL_IEEE802154_ACCEPT_ACK_FRAMES : 0U)
+                  | (SL_RAIL_UTIL_PROTOCOL_IEEE802154_2P4GHZ_ACCEPT_COMMAND_FRAME_ENABLE
+                     ? RAIL_IEEE802154_ACCEPT_COMMAND_FRAMES : 0U),
+    // Enable promiscous mode since no PANID or destination address is
+    // specified.
+    .promiscuousMode = SL_RAIL_UTIL_PROTOCOL_IEEE802154_2P4GHZ_PROMISCUOUS_MODE_ENABLE,
+    .isPanCoordinator = SL_RAIL_UTIL_PROTOCOL_IEEE802154_2P4GHZ_PAN_COORDINATOR_ENABLE,
+    .defaultFramePendingInOutgoingAcks = SL_RAIL_UTIL_PROTOCOL_IEEE802154_2P4GHZ_DEFAULT_FRAME_PENDING_STATE,
+  };
+  status = RAIL_IEEE802154_Init(handle, &config);
+  if (RAIL_STATUS_NO_ERROR == status) {
+    status = RAIL_IEEE802154_Config2p4GHzRadio(handle);
+  }
+  if (RAIL_STATUS_NO_ERROR != status) {
+    (void) RAIL_IEEE802154_Deinit(handle);
+  }
+  return status;
+}
+
+#if 1
 /* Driver initialization */
 static int efr32_init(const struct device *dev)
 {
     struct erf32_data *efr32 = dev->data;
     RAIL_Status_t status = RAIL_STATUS_NO_ERROR;
-
-    static const RAIL_DataConfig_t rail_data_config = {
-        TX_PACKET_DATA,
-        RX_PACKET_DATA,
-        PACKET_MODE,
-        PACKET_MODE,
-    };
-
-	// A macro RAIL_TX_POWER_CURVES_CONFIG is used as the curve
-	// structures used by the provided conversion functions.
-	RAIL_DECLARE_TX_POWER_VBAT_CURVES_ALT;
-	const RAIL_TxPowerCurvesConfigAlt_t tx_power_curves_config = RAIL_DECLARE_TX_POWER_CURVES_CONFIG_ALT;
-
-
+#if 0
     // Switch to the 2.4GHz HP PA powered off the 1.8V DCDC connection
   	RAIL_TxPowerConfig_t railTxPowerConfig = {
 		RAIL_TX_POWER_MODE_2P4GIG_HP, // 2.4GHz HP Power Amplifier mode
@@ -365,26 +378,51 @@ static int efr32_init(const struct device *dev)
 		10                            // Desired ramp time in us
   	};
 
-    efr32->rail_handle = RAIL_Init(&s_rail_config, NULL);
-	efr32->packet_handle = RAIL_RX_PACKET_HANDLE_INVALID;
-
-    k_sem_init(&efr32->rx_wait, 0, 1);
-    k_sem_init(&efr32->tx_wait, 0, 1);
-
-    if (efr32->rail_handle == NULL)
-    {
-        LOG_ERR("Unable to init");
+	status = RAIL_InitTxPowerCurvesAlt(&RAIL_TxPowerCurvesDcdc);
+	if (status != RAIL_STATUS_NO_ERROR){
+        LOG_ERR("Error with config data.");
         return -EIO;
     }
 
-    status = RAIL_ConfigData(efr32->rail_handle, &rail_data_config);
+    status = RAIL_ConfigTxPower(efr32->rail_handle, &railTxPowerConfig);
+    if (status != RAIL_STATUS_NO_ERROR){
+        LOG_ERR("Error with config data.");
+        return -EIO;
+    }
+
+	efr32_set_txpower(dev, 25);
+#endif
+
+	// initializes RAIL handler
+    efr32->rail_handle = RAIL_Init(&s_rail_config, NULL);
+    
+	// configure the data management
+	static const RAIL_DataConfig_t rail_data_config = {
+        .txSource = TX_PACKET_DATA,
+        .rxSource = RX_PACKET_DATA,
+        .txMethod = PACKET_MODE,
+        .rxMethod = PACKET_MODE,
+    };
+	status = RAIL_ConfigData(efr32->rail_handle, &rail_data_config);
     if (status != RAIL_STATUS_NO_ERROR)
     {
         LOG_ERR("Error with config data.");
         return -EIO;
     }
 
+	// configures the channels
+	const RAIL_ChannelConfig_t *channel_config = NULL;
+  	(void) RAIL_ConfigChannels(efr32->rail_handle, channel_config, NULL);
 
+	// configures the IEEE 802.15.4 2.4Ghz protocol
+	status = efr32_config_ieee802154_2p4ghz(efr32->rail_handle);
+	if (status != RAIL_STATUS_NO_ERROR)
+    {
+        LOG_ERR("Error with config data.");
+        return -EIO;
+    }
+
+	// condifures RAIL calibration
     status = RAIL_ConfigCal(efr32->rail_handle, RAIL_CAL_ALL);
     if (status != RAIL_STATUS_NO_ERROR)
     {
@@ -392,27 +430,19 @@ static int efr32_init(const struct device *dev)
         return -EIO;
     }
 
-    status = RAIL_IEEE802154_Config2p4GHzRadio(efr32->rail_handle);
-    if (status != RAIL_STATUS_NO_ERROR)
-    {
-        return -EIO;
-    }
+	// handle used to reference a packet during reception processing
+	efr32->packet_handle = RAIL_RX_PACKET_HANDLE_INVALID;
 
-    status = RAIL_IEEE802154_Init(efr32->rail_handle, &rail_ieee802154_config);
-    if (status != RAIL_STATUS_NO_ERROR)
-    {
-        return -EIO;
-    }
-
-    RAIL_SetTxFifo(efr32->rail_handle, efr32->tx_buffer, 0, (uint16_t) ERF32_TX_BUFFER_LENGTH);
+	/* RAIL FIFO allocation
+    efr32->tx_buffer_size = RAIL_SetTxFifo(efr32->rail_handle, efr32->tx_buffer, 0, (uint16_t) ERF32_TX_BUFFER_LENGTH);
 	status = RAIL_SetRxFifo(efr32->rail_handle, efr32->rx_buffer, &efr32->rx_buffer_size);
 	if (status != RAIL_STATUS_NO_ERROR)
     {
         return -EIO;
     }
-	
 	RAIL_SetTxFifoThreshold(efr32->rail_handle, (size_t) (0.9 * ERF32_TX_BUFFER_LENGTH));
 	RAIL_SetRxFifoThreshold(efr32->rail_handle, (size_t) (0.9 * ERF32_RX_BUFFER_LENGTH));
+	*/
 
     status = RAIL_ConfigEvents(efr32->rail_handle, RAIL_EVENTS_ALL,
 		RAIL_EVENTS_RX_COMPLETION
@@ -429,16 +459,8 @@ static int efr32_init(const struct device *dev)
         return -EIO;
     }
 
-    status = RAIL_InitTxPowerCurvesAlt(&tx_power_curves_config);
-
-    if (status != RAIL_STATUS_NO_ERROR)
-    {
-        return -EIO;
-    }
-
-    status = RAIL_ConfigTxPower(efr32->rail_handle, &railTxPowerConfig);
-
-    efr32_set_txpower(dev, 10);
+	k_sem_init(&efr32->rx_wait, 0, 1);
+    k_sem_init(&efr32->tx_wait, 0, 1);
     
     k_thread_create(&efr32->rx_thread, efr32->rx_stack,
                     CONFIG_IEEE802154_EFR32_RX_STACK_SIZE,
@@ -448,6 +470,14 @@ static int efr32_init(const struct device *dev)
     LOG_DBG("Init done!");
     return 0;
 }
+#else
+/* Driver initialization */
+static int efr32_init(const struct device *dev){
+	sl_rail_util_pa_init();
+	sl_flex_util_init();
+	sl_rail_util_dma_init();
+}
+#endif
 
 static void efr32_rail_cb(RAIL_Handle_t rail_handle, RAIL_Events_t events)
 {
@@ -521,6 +551,8 @@ static void efr32_rail_cb(RAIL_Handle_t rail_handle, RAIL_Events_t events)
 	}
 }
 
+/* driver-allocated attribute memory - constant across all driver instances */
+IEEE802154_DEFINE_PHY_SUPPORTED_CHANNELS(drv_attr, 11, 26);
 
 /* IEEE802154 driver APIs structure */
 static const struct ieee802154_radio_api efr32_radio_api = {
