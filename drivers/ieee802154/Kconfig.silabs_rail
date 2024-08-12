@@ -7,7 +7,7 @@ menuconfig IEEE802154_SILABS_RAIL
 	bool "Silicon Labs ieee802154 RAIL support"
 	default y
 	depends on DT_HAS_SILABS_RAIL_IEEE802154_ENABLED
-        select SOC_GECKO_USE_RAIL
+        select SOC_GECKO_CUSTOM_RADIO_PHY
 
 if IEEE802154_SILABS_RAIL
 
@@ -17,12 +17,6 @@ config IEEE802154_SILABS_RAIL_INIT_PRIO
 	help
 	  Set the initialization priority number. Do not change it unless
 	  you know what you are doing. It has to start before the net stack.
-
-config IEEE802154_RAIL_LIB_PATH
-        string "Path to Silicon Labs RAIL library"
-		default "C:/Zephyr_Fork/silabs_hal_lib"
-        help
-          Path to the Silicon Labs RAIL library.
 
 config IEEE802154_EFR32_RX_STACK_SIZE
 	int "Driver's internal RX thread stack size"
