@@ -5,6 +5,7 @@
  */
 
 #include "rail.h"
+#include "rail_types.h"
 
 #ifndef ZEPHYR_DRIVERS_IEEE802154_IEEE802154_ERF32_H
 #define ZEPHYR_DRIVERS_IEEE802154_IEEE802154_ERF32_H
@@ -61,16 +62,29 @@ typedef enum e_efr32_state
 struct erf32_data {
 	struct  net_if *iface;
 	uint8_t mac_addr[ERF32_IEEE_ADDRESS_SIZE];
-	
-	RAIL_Handle_t rail_handle;
-	RAIL_RxPacketHandle_t packet_handle;
 
-	uint8_t rx_buffer[ERF32_RX_BUFFER_LENGTH];
+	// RAIL handle struct
+	RAIL_Handle_t         rail_handle;
+	RAIL_RxPacketHandle_t packet_handle;
+    
+    // Handler configuration options
+    RAIL_Config_t rail_config;
+
+    // configures the channels
+    const RAIL_ChannelConfig_t *rail_channel_config;
+    uint8_t                    mChannelMin;
+    uint8_t                    mChannelMax;
+
+    // RAIL hanlde callback
+    void (*aEventCallback)(RAIL_Handle_t railHandle, RAIL_Events_t events);
+	
+    // RAIL FIFO buffer
+    uint8_t rx_buffer[ERF32_RX_BUFFER_LENGTH];
 	uint8_t tx_buffer[ERF32_TX_BUFFER_LENGTH];
 
+    // RAIL buffer size
     uint16_t rx_buffer_size;
     uint16_t tx_buffer_size;
-
 
 	K_THREAD_STACK_MEMBER(rx_stack, CONFIG_IEEE802154_EFR32_RX_STACK_SIZE);
     struct k_thread rx_thread;
@@ -85,6 +99,12 @@ struct erf32_data {
 	 * sent or CCA failed.
 	 */
     struct k_sem tx_wait;
+
+    /* TX FIFO queue
+     *
+     */
+    struct k_fifo tx_fifo;
+    
 
     /* TX result. Set to 1 on success, 0 otherwise. */
     bool tx_success;
